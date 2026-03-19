@@ -1,0 +1,382 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+from dotenv import load_dotenv
+from livekit.agents import AgentSession, JobContext, WorkerOptions, cli
+from livekit.plugins import assemblyai, cartesia, openai, silero
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+from agents.sales import build_sales_agent, derive_outcome
+from firestore_client import get_agent_config, update_event_status, write_event_disposition
+from gcs_client import write_transcript
+
+load_dotenv()
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
+def _clamp_float(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _clamp_int(value: int, low: int, high: int) -> int:
+    return max(low, min(high, value))
+
+
+# Lazy init so deploy-time "python main.py download-files" does not fail.
+_VAD_MODEL: Any | None = None
+
+
+def _get_vad_model() -> Any:
+    global _VAD_MODEL
+    if _VAD_MODEL is None:
+        _VAD_MODEL = silero.VAD.load()
+    return _VAD_MODEL
+
+
+def _build_turn_detector() -> Any | None:
+    if not _env_bool("LK_ENABLE_TURN_DETECTOR", True):
+        return None
+    threshold = _clamp_float(_env_float("LK_TURN_UNLIKELY_THRESHOLD", 0.25), 0.0, 1.0)
+    try:
+        return MultilingualModel(unlikely_threshold=threshold)
+    except Exception as exc:
+        # Never fail call start just because turn detector isn't available.
+        print(f"Turn detector disabled at runtime: {exc}", flush=True)
+        return None
+
+
+def _safe_parse_metadata(raw_metadata: Any) -> dict[str, Any]:
+    if isinstance(raw_metadata, dict):
+        return raw_metadata
+    if not raw_metadata:
+        return {}
+    try:
+        parsed = json.loads(str(raw_metadata))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {}
+
+
+@dataclass
+class TranscriptTurn:
+    timestamp_utc: str
+    role: str
+    text: str
+    interrupted: bool = False
+
+
+@dataclass
+class RuntimeTuning:
+    stt_model: str
+    tts_model: str
+    stt_buffer_size_seconds: float
+    stt_min_turn_silence_ms: int
+    stt_max_turn_silence_ms: int
+    stt_eot_confidence_threshold: float
+    min_endpointing_delay: float
+    max_endpointing_delay: float
+    min_consecutive_speech_delay: float
+    llm_temperature: float
+    llm_max_completion_tokens: int
+    preemptive_generation: bool
+
+
+def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
+    # Critical reliability fix: AssemblyAI requires 50ms..1000ms.
+    raw_buffer = float(
+        agent_config.get("stt_buffer_size_seconds", _env_float("LK_STT_BUFFER_SIZE_SECONDS", 0.06))
+    )
+    stt_buffer = _clamp_float(raw_buffer, 0.05, 1.0)
+    if stt_buffer != raw_buffer:
+        print(
+            f"Adjusted stt_buffer_size_seconds from {raw_buffer} to {stt_buffer} (AssemblyAI-safe).",
+            flush=True,
+        )
+
+    raw_min_turn = int(agent_config.get("stt_min_turn_silence_ms", _env_int("LK_STT_MIN_TURN_SILENCE_MS", 300)))
+    raw_max_turn = int(agent_config.get("stt_max_turn_silence_ms", _env_int("LK_STT_MAX_TURN_SILENCE_MS", 900)))
+    min_turn = _clamp_int(raw_min_turn, 150, 2000)
+    max_turn = _clamp_int(raw_max_turn, 300, 5000)
+    if max_turn < min_turn:
+        max_turn = min_turn
+
+    eot_conf = _clamp_float(
+        float(
+            agent_config.get(
+                "stt_end_of_turn_confidence_threshold",
+                _env_float("LK_STT_END_OF_TURN_CONFIDENCE_THRESHOLD", 0.55),
+            )
+        ),
+        0.0,
+        1.0,
+    )
+
+    min_ep = _clamp_float(
+        float(agent_config.get("min_endpointing_delay", _env_float("LK_MIN_ENDPOINTING_DELAY", 0.15))),
+        0.0,
+        5.0,
+    )
+    max_ep = _clamp_float(
+        float(agent_config.get("max_endpointing_delay", _env_float("LK_MAX_ENDPOINTING_DELAY", 0.90))),
+        0.1,
+        8.0,
+    )
+    if max_ep < min_ep:
+        max_ep = min_ep
+
+    min_consecutive = _clamp_float(
+        float(agent_config.get("min_consecutive_speech_delay", _env_float("LK_MIN_CONSECUTIVE_SPEECH_DELAY", 0.05))),
+        0.0,
+        1.5,
+    )
+
+    llm_temp = _clamp_float(float(agent_config.get("llm_temperature", _env_float("LK_LLM_TEMPERATURE", 0.2))), 0.0, 1.2)
+    llm_max_tokens = _clamp_int(
+        int(agent_config.get("llm_max_completion_tokens", _env_int("LK_LLM_MAX_COMPLETION_TOKENS", 90))),
+        32,
+        600,
+    )
+
+    return RuntimeTuning(
+        stt_model=str(agent_config.get("stt_model", os.getenv("LK_STT_MODEL", "universal-streaming-english"))),
+        tts_model=str(agent_config.get("tts_model", os.getenv("LK_TTS_MODEL", "sonic-turbo"))),
+        stt_buffer_size_seconds=stt_buffer,
+        stt_min_turn_silence_ms=min_turn,
+        stt_max_turn_silence_ms=max_turn,
+        stt_eot_confidence_threshold=eot_conf,
+        min_endpointing_delay=min_ep,
+        max_endpointing_delay=max_ep,
+        min_consecutive_speech_delay=min_consecutive,
+        llm_temperature=llm_temp,
+        llm_max_completion_tokens=llm_max_tokens,
+        preemptive_generation=_env_bool("LK_PREEMPTIVE_GENERATION", True),
+    )
+
+
+def _to_role_string(role: Any) -> str:
+    value = getattr(role, "value", role)
+    return str(value).lower()
+
+
+def _extract_item_text(item: Any) -> str:
+    text_content = getattr(item, "text_content", None)
+    if text_content:
+        return str(text_content).strip()
+
+    content = getattr(item, "content", None)
+    if not content:
+        return ""
+
+    parts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            stripped = part.strip()
+            if stripped:
+                parts.append(stripped)
+            continue
+
+        transcript = getattr(part, "transcript", None)
+        if transcript and str(transcript).strip():
+            parts.append(str(transcript).strip())
+
+    return " ".join(parts).strip()
+
+
+async def entrypoint(ctx: JobContext) -> None:
+    raw_metadata = getattr(ctx.job, "metadata", None) or "{}"
+    metadata = _safe_parse_metadata(raw_metadata)
+
+    client_id = str(metadata.get("client_id", "verifacto"))
+    event_id = str(metadata.get("event_id", ""))
+    agent_id = str(metadata.get("agent_id", "sales"))
+    contact = metadata.get("contact", {}) if isinstance(metadata.get("contact"), dict) else {}
+
+    print(f"Starting call: client={client_id} event={event_id} agent={agent_id}", flush=True)
+
+    try:
+        agent_config = get_agent_config(client_id, agent_id)
+    except Exception as exc:
+        print(f"Failed to load agent config: {exc}", flush=True)
+        agent_config = {}
+
+    agent, disposition = build_sales_agent(contact, agent_config)
+
+    await ctx.connect()
+    call_started_at = datetime.now(timezone.utc)
+    transcript: list[TranscriptTurn] = []
+    finalized = False
+
+    if client_id and event_id:
+        try:
+            update_event_status(client_id, event_id, "active")
+        except Exception as exc:
+            print(f"Could not update event status: {exc}", flush=True)
+
+    tuning = _build_runtime_tuning(agent_config)
+    voice = str(agent_config.get("voice", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"))
+    llm_model = str(agent_config.get("llm_model", "gpt-4o-mini"))
+    turn_detector = _build_turn_detector()
+
+    session = AgentSession(
+        stt=assemblyai.STT(
+            model=tuning.stt_model,
+            language_detection=False,
+            end_of_turn_confidence_threshold=tuning.stt_eot_confidence_threshold,
+            min_turn_silence=tuning.stt_min_turn_silence_ms,
+            max_turn_silence=tuning.stt_max_turn_silence_ms,
+            buffer_size_seconds=tuning.stt_buffer_size_seconds,
+        ),
+        llm=openai.LLM(
+            model=llm_model,
+            temperature=tuning.llm_temperature,
+            max_completion_tokens=tuning.llm_max_completion_tokens,
+            parallel_tool_calls=False,
+        ),
+        tts=cartesia.TTS(
+            model=tuning.tts_model,
+            voice=voice,
+            language="en",
+            word_timestamps=False,
+        ),
+        vad=_get_vad_model(),
+        turn_detection=turn_detector,
+        preemptive_generation=tuning.preemptive_generation,
+        min_endpointing_delay=tuning.min_endpointing_delay,
+        max_endpointing_delay=tuning.max_endpointing_delay,
+        min_consecutive_speech_delay=tuning.min_consecutive_speech_delay,
+    )
+
+    @session.on("conversation_item_added")
+    def _on_conversation_item_added(event: Any) -> None:
+        item = getattr(event, "item", None)
+        if item is None:
+            return
+        text = _extract_item_text(item)
+        if not text:
+            return
+        transcript.append(
+            TranscriptTurn(
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                role=_to_role_string(getattr(item, "role", "unknown")),
+                text=text,
+                interrupted=bool(getattr(item, "interrupted", False)),
+            )
+        )
+
+    @session.on("user_input_transcribed")
+    def _on_user_input_transcribed(event: Any) -> None:
+        text = str(getattr(event, "transcript", "")).strip()
+        if text:
+            print(f"user_input_transcribed(final={bool(getattr(event, 'is_final', False))}): {text}", flush=True)
+
+    def _finalize_once(trigger: str) -> None:
+        nonlocal finalized
+        if finalized:
+            return
+        finalized = True
+
+        call_ended_at = datetime.now(timezone.utc)
+        duration_seconds = max(0, int((call_ended_at - call_started_at).total_seconds()))
+        outcome = derive_outcome(disposition)
+        disposition_dict = asdict(disposition)
+
+        print(f"Call ended. trigger={trigger} outcome={outcome}", flush=True)
+
+        transcript_available = False
+        if client_id and event_id:
+            try:
+                write_transcript(
+                    client_id=client_id,
+                    event_id=event_id,
+                    transcript=transcript,
+                    metadata={
+                        "outcome": outcome,
+                        "agent_id": agent_id,
+                        "duration_seconds": duration_seconds,
+                    },
+                )
+                transcript_available = True
+            except Exception as exc:
+                print(f"Transcript write failed: {exc}", flush=True)
+
+        if client_id and event_id:
+            try:
+                write_event_disposition(
+                    client_id=client_id,
+                    event_id=event_id,
+                    disposition=disposition_dict,
+                    outcome=outcome,
+                    duration_seconds=duration_seconds,
+                    transcript_available=transcript_available,
+                )
+            except Exception as exc:
+                print(f"Firestore write failed: {exc}", flush=True)
+
+    @session.on("close")
+    def _on_session_close(event: Any) -> None:
+        reason = str(getattr(event, "reason", "unknown"))
+        _finalize_once(f"session_close:{reason}")
+
+    customer_name = str(contact.get("customer_name", "there"))
+    agent_name = str(agent_config.get("agent_name", "Sophie"))
+    company_name = str(agent_config.get("company_name", "our company"))
+
+    await session.start(room=ctx.room, agent=agent)
+
+    # Deterministic opening line gives reliable first speech.
+    await session.say(
+        f"Hello, this is {agent_name}. I'm a virtual representative calling from {company_name}. "
+        f"May I please speak with {customer_name}?",
+        add_to_chat_ctx=True,
+    )
+
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _finalize_once("entrypoint_finally")
+
+
+if __name__ == "__main__":
+    cli.run_app(
+        WorkerOptions(
+            entrypoint_fnc=entrypoint,
+            agent_name="verifacto-sales-agent",
+        )
+    )

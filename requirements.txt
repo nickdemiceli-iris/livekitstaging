@@ -1,0 +1,9 @@
+livekit-agents~=1.4.0
+livekit-plugins-openai~=1.4.0
+livekit-plugins-assemblyai~=1.4.0
+livekit-plugins-cartesia~=1.4.0
+livekit-plugins-silero~=1.4.0
+livekit-plugins-turn-detector~=1.4.0
+python-dotenv~=1.0
+google-cloud-firestore~=2.16
+google-cloud-storage~=2.18
