@@ -153,7 +153,9 @@ class TranscriptTurn:
 @dataclass
 class RuntimeTuning:
     stt_model: str
+    tts_provider: str
     tts_model: str
+    tts_voice: str
     stt_buffer_size_seconds: float
     stt_min_turn_silence_ms: int
     stt_max_turn_silence_ms: int
@@ -256,15 +258,36 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     if stt_model != raw_stt_model:
         print(f"Unsupported stt_model '{raw_stt_model}', using '{stt_model}'", flush=True)
 
-    raw_tts_model = str(agent_config.get("tts_model", os.getenv("LK_TTS_MODEL", "sonic-turbo"))).strip()
-    allowed_tts_models = {"sonic-turbo", "sonic-3", "sonic-2", "sonic"}
-    tts_model = raw_tts_model if raw_tts_model in allowed_tts_models else "sonic-turbo"
-    if tts_model != raw_tts_model:
-        print(f"Unsupported tts_model '{raw_tts_model}', using '{tts_model}'", flush=True)
+    raw_tts_provider = str(agent_config.get("tts_provider", os.getenv("LK_TTS_PROVIDER", "openai"))).strip().lower()
+    tts_provider = raw_tts_provider if raw_tts_provider in {"openai", "cartesia"} else "openai"
+    if tts_provider != raw_tts_provider:
+        print(f"Unsupported tts_provider '{raw_tts_provider}', using '{tts_provider}'", flush=True)
+
+    if tts_provider == "cartesia":
+        raw_tts_model = str(agent_config.get("tts_model", os.getenv("LK_TTS_MODEL", "sonic-turbo"))).strip()
+        allowed_tts_models = {"sonic-turbo", "sonic-3", "sonic-2", "sonic"}
+        tts_model = raw_tts_model if raw_tts_model in allowed_tts_models else "sonic-turbo"
+        if tts_model != raw_tts_model:
+            print(f"Unsupported cartesia tts_model '{raw_tts_model}', using '{tts_model}'", flush=True)
+        tts_voice = str(
+            agent_config.get(
+                "voice",
+                os.getenv("LK_CARTESIA_VOICE", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+            )
+        ).strip()
+    else:
+        raw_tts_model = str(agent_config.get("openai_tts_model", os.getenv("LK_OPENAI_TTS_MODEL", "gpt-4o-mini-tts"))).strip()
+        allowed_tts_models = {"gpt-4o-mini-tts", "gpt-4o-realtime-preview-tts"}
+        tts_model = raw_tts_model if raw_tts_model in allowed_tts_models else "gpt-4o-mini-tts"
+        if tts_model != raw_tts_model:
+            print(f"Unsupported openai tts_model '{raw_tts_model}', using '{tts_model}'", flush=True)
+        tts_voice = str(agent_config.get("openai_tts_voice", os.getenv("LK_OPENAI_TTS_VOICE", "ash"))).strip() or "ash"
 
     return RuntimeTuning(
         stt_model=stt_model,
+        tts_provider=tts_provider,
         tts_model=tts_model,
+        tts_voice=tts_voice,
         stt_buffer_size_seconds=stt_buffer,
         stt_min_turn_silence_ms=min_turn,
         stt_max_turn_silence_ms=max_turn,
@@ -341,9 +364,22 @@ async def entrypoint(ctx: JobContext) -> None:
             print(f"Could not update event status: {exc}", flush=True)
 
     tuning = _build_runtime_tuning(agent_config)
-    voice = str(agent_config.get("voice", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"))
     llm_model = str(agent_config.get("llm_model", "gpt-4o-mini"))
     turn_detector = _build_turn_detector()
+
+    if tuning.tts_provider == "cartesia":
+        tts_engine = cartesia.TTS(
+            model=tuning.tts_model,
+            voice=tuning.tts_voice,
+            language="en",
+            word_timestamps=False,
+        )
+    else:
+        # OpenAI TTS is the reliability default for production fallback.
+        tts_engine = openai.TTS(
+            model=tuning.tts_model,
+            voice=tuning.tts_voice,
+        )
 
     session = AgentSession(
         stt=assemblyai.STT(
@@ -360,12 +396,7 @@ async def entrypoint(ctx: JobContext) -> None:
             max_completion_tokens=tuning.llm_max_completion_tokens,
             parallel_tool_calls=False,
         ),
-        tts=cartesia.TTS(
-            model=tuning.tts_model,
-            voice=voice,
-            language="en",
-            word_timestamps=False,
-        ),
+        tts=tts_engine,
         vad=_get_vad_model(),
         turn_detection=turn_detector,
         preemptive_generation=tuning.preemptive_generation,
