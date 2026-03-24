@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from livekit.agents import AgentSession, JobContext, WorkerOptions, cli
+from livekit.agents import AgentSession, JobContext, WorkerOptions, cli, tts as lk_tts
 from livekit.plugins import assemblyai, cartesia, openai, silero
 
 try:
@@ -218,6 +218,10 @@ class RuntimeTuning:
     tts_provider: str
     tts_model: str
     tts_voice: str
+    openai_tts_model: str
+    openai_tts_voice: str
+    tts_fallback_enabled: bool
+    tts_fallback_max_retry_per_provider: int
     stt_buffer_size_seconds: float
     stt_min_turn_silence_ms: int
     stt_max_turn_silence_ms: int
@@ -329,14 +333,32 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     if stt_model != raw_stt_model:
         print(f"Unsupported stt_model '{raw_stt_model}', using '{stt_model}'", flush=True)
 
+    cartesia_enabled = _env_bool_any(("CARTESIA_TTS_ENABLED",), True)
     env_tts_provider = _env_first(("LK_TTS_PROVIDER",), "").strip().lower()
-    if not env_tts_provider:
-        env_tts_provider = "cartesia" if _env_bool_any(("CARTESIA_TTS_ENABLED",), False) else "openai"
-
-    raw_tts_provider = str(agent_config.get("tts_provider", env_tts_provider or "openai")).strip().lower()
+    if "tts_provider" in agent_config:
+        raw_tts_provider = str(agent_config.get("tts_provider", "cartesia")).strip().lower()
+    elif env_tts_provider:
+        raw_tts_provider = env_tts_provider
+    elif cartesia_enabled:
+        # Keep Cartesia as primary when explicitly enabled.
+        raw_tts_provider = "cartesia"
+    else:
+        raw_tts_provider = "cartesia"
     tts_provider = raw_tts_provider if raw_tts_provider in {"openai", "cartesia"} else "openai"
     if tts_provider != raw_tts_provider:
         print(f"Unsupported tts_provider '{raw_tts_provider}', using '{tts_provider}'", flush=True)
+
+    openai_tts_model = _env_first(("LK_OPENAI_TTS_MODEL", "OPENAI_TTS_MODEL"), "gpt-4o-mini-tts")
+    if openai_tts_model not in {"gpt-4o-mini-tts", "gpt-4o-realtime-preview-tts"}:
+        print(f"Unsupported openai tts model '{openai_tts_model}', using 'gpt-4o-mini-tts'", flush=True)
+        openai_tts_model = "gpt-4o-mini-tts"
+    openai_tts_voice = _env_first(("LK_OPENAI_TTS_VOICE", "OPENAI_TTS_VOICE"), "ash")
+    tts_fallback_enabled = _env_bool_any(("OPENAI_TTS_FALLBACK_ENABLED", "LK_TTS_OPENAI_FALLBACK_ENABLED"), False)
+    tts_fallback_max_retry_per_provider = _clamp_int(
+        _env_int_any(("TTS_FALLBACK_MAX_RETRY_PER_PROVIDER",), 1),
+        1,
+        5,
+    )
 
     if tts_provider == "cartesia":
         raw_tts_model = str(
@@ -381,6 +403,10 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         tts_provider=tts_provider,
         tts_model=tts_model,
         tts_voice=tts_voice,
+        openai_tts_model=openai_tts_model,
+        openai_tts_voice=openai_tts_voice,
+        tts_fallback_enabled=tts_fallback_enabled,
+        tts_fallback_max_retry_per_provider=tts_fallback_max_retry_per_provider,
         stt_buffer_size_seconds=stt_buffer,
         stt_min_turn_silence_ms=min_turn,
         stt_max_turn_silence_ms=max_turn,
@@ -469,6 +495,7 @@ async def entrypoint(ctx: JobContext) -> None:
             f"stt_model={tuning.stt_model}, "
             f"tts_provider={tuning.tts_provider}, "
             f"tts_model={tuning.tts_model}, "
+            f"tts_fallback_enabled={tuning.tts_fallback_enabled}, "
             f"preemptive_generation={tuning.preemptive_generation}, "
             f"turn_detector={'on' if turn_detector is not None else 'off'}"
         ),
@@ -476,14 +503,25 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     if tuning.tts_provider == "cartesia":
-        tts_engine = cartesia.TTS(
+        cartesia_tts_engine = cartesia.TTS(
             model=tuning.tts_model,
             voice=tuning.tts_voice,
             language="en",
             word_timestamps=False,
         )
+        if tuning.tts_fallback_enabled:
+            # Cartesia primary with OpenAI fallback for provider-side outages.
+            openai_tts_engine = openai.TTS(
+                model=tuning.openai_tts_model,
+                voice=tuning.openai_tts_voice,
+            )
+            tts_engine = lk_tts.FallbackAdapter(
+                [cartesia_tts_engine, openai_tts_engine],
+                max_retry_per_tts=tuning.tts_fallback_max_retry_per_provider,
+            )
+        else:
+            tts_engine = cartesia_tts_engine
     else:
-        # OpenAI TTS is the reliability default for production fallback.
         tts_engine = openai.TTS(
             model=tuning.tts_model,
             voice=tuning.tts_voice,
