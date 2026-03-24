@@ -218,6 +218,7 @@ class TranscriptTurn:
 @dataclass
 class RuntimeTuning:
     stt_model: str
+    stt_language: str
     tts_provider: str
     tts_model: str
     tts_voice: str
@@ -239,10 +240,14 @@ class RuntimeTuning:
 
 
 def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
+    low_latency_mode = _env_bool_any(("LK_LOW_LATENCY_MODE",), True)
+
+    stt_language = _env_first(("ASSEMBLYAI__LANGUAGE", "LK_STT_LANGUAGE", "TTS_LANGUAGE"), "en").strip().lower() or "en"
+
     # Critical reliability fix: AssemblyAI requires 50ms..1000ms.
     raw_buffer = _to_float(
         agent_config.get("stt_buffer_size_seconds"),
-        _env_float_any(("LK_STT_BUFFER_SIZE_SECONDS", "ASSEMBLYAI_BUFFER_SIZE_SECONDS"), 0.06),
+        _env_float_any(("LK_STT_BUFFER_SIZE_SECONDS", "ASSEMBLYAI_BUFFER_SIZE_SECONDS"), 0.05),
     )
     stt_buffer = _clamp_float(raw_buffer, 0.05, 1.0)
     if stt_buffer != raw_buffer:
@@ -253,11 +258,11 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
 
     raw_min_turn = _to_int(
         agent_config.get("stt_min_turn_silence_ms"),
-        _env_int_any(("LK_STT_MIN_TURN_SILENCE_MS", "ASSEMBLYAI_MIN_EOT_SILENCE_MS"), 300),
+        _env_int_any(("LK_STT_MIN_TURN_SILENCE_MS", "ASSEMBLYAI_MIN_EOT_SILENCE_MS"), 160),
     )
     raw_max_turn = _to_int(
         agent_config.get("stt_max_turn_silence_ms"),
-        _env_int_any(("LK_STT_MAX_TURN_SILENCE_MS", "ASSEMBLYAI_MAX_TURN_SILENCE_MS"), 900),
+        _env_int_any(("LK_STT_MAX_TURN_SILENCE_MS", "ASSEMBLYAI_MAX_TURN_SILENCE_MS"), 550),
     )
     min_turn = _clamp_int(raw_min_turn, 150, 2000)
     max_turn = _clamp_int(raw_max_turn, 300, 5000)
@@ -269,7 +274,7 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
             agent_config.get("stt_end_of_turn_confidence_threshold"),
             _env_float_any(
                 ("LK_STT_END_OF_TURN_CONFIDENCE_THRESHOLD", "ASSEMBLYAI_END_OF_TURN_CONFIDENCE_THRESHOLD"),
-                0.55,
+                0.42,
             ),
         ),
         0.0,
@@ -279,7 +284,7 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     min_ep = _clamp_float(
         _to_float(
             agent_config.get("min_endpointing_delay"),
-            _env_float("LK_MIN_ENDPOINTING_DELAY", 0.15),
+            _env_float("LK_MIN_ENDPOINTING_DELAY", 0.08),
         ),
         0.0,
         5.0,
@@ -287,7 +292,7 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     max_ep = _clamp_float(
         _to_float(
             agent_config.get("max_endpointing_delay"),
-            _env_float("LK_MAX_ENDPOINTING_DELAY", 0.90),
+            _env_float("LK_MAX_ENDPOINTING_DELAY", 0.45),
         ),
         0.1,
         8.0,
@@ -305,14 +310,14 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     )
 
     llm_temp = _clamp_float(
-        _to_float(agent_config.get("llm_temperature"), _env_float("LK_LLM_TEMPERATURE", 0.2)),
+        _to_float(agent_config.get("llm_temperature"), _env_float("LK_LLM_TEMPERATURE", 0.15)),
         0.0,
         1.2,
     )
     llm_max_tokens = _clamp_int(
         _to_int(
             agent_config.get("llm_max_completion_tokens"),
-            _env_int("LK_LLM_MAX_COMPLETION_TOKENS", 90),
+            _env_int("LK_LLM_MAX_COMPLETION_TOKENS", 64),
         ),
         32,
         600,
@@ -336,6 +341,15 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     stt_model = raw_stt_model if raw_stt_model in allowed_stt_models else "universal-streaming-english"
     if stt_model != raw_stt_model:
         print(f"Unsupported stt_model '{raw_stt_model}', using '{stt_model}'", flush=True)
+    # For English-only outbound campaigns, the English model generally responds faster.
+    if (
+        low_latency_mode
+        and stt_model == "universal-streaming-multilingual"
+        and stt_language.startswith("en")
+        and _env_bool_any(("LK_PREFER_ENGLISH_STT",), True)
+    ):
+        stt_model = "universal-streaming-english"
+        print("Switching STT model to universal-streaming-english for lower latency.", flush=True)
 
     cartesia_enabled = _env_bool_any(("CARTESIA_TTS_ENABLED",), True)
     env_tts_provider = _env_first(("LK_TTS_PROVIDER",), "").strip().lower()
@@ -413,6 +427,7 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
 
     return RuntimeTuning(
         stt_model=stt_model,
+        stt_language=stt_language,
         tts_provider=tts_provider,
         tts_model=tts_model,
         tts_voice=tts_voice,
@@ -507,6 +522,7 @@ async def entrypoint(ctx: JobContext) -> None:
         (
             "Runtime settings: "
             f"stt_model={tuning.stt_model}, "
+            f"stt_language={tuning.stt_language}, "
             f"tts_provider={tuning.tts_provider}, "
             f"tts_model={tuning.tts_model}, "
             f"tts_voice={tuning.tts_voice}, "
