@@ -23,6 +23,9 @@ from gcs_client import write_transcript
 
 load_dotenv()
 
+# Cartesia "Katie" is a stable, high-quality feminine voice for sales conversations.
+CARTESIA_DEFAULT_FEMALE_VOICE = "f786b574-daa5-4673-aa0c-cbe3e8534c02"
+
 
 def _env_float(name: str, default: float) -> float:
     value = os.getenv(name, "").strip()
@@ -365,7 +368,7 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         raw_tts_model = str(
             agent_config.get(
                 "tts_model",
-                _env_first(("LK_TTS_MODEL", "CARTESIA_TTS_MODEL"), "sonic-turbo"),
+                _env_first(("LK_TTS_MODEL", "CARTESIA_TTS_MODEL"), "sonic-3"),
             )
         ).strip()
         allowed_tts_models = {"sonic-turbo", "sonic-3", "sonic-2", "sonic"}
@@ -375,13 +378,13 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         tts_voice = str(
             agent_config.get(
                 "voice",
-                _env_first(("LK_CARTESIA_VOICE", "CARTESIA_TTS_VOICE"), "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+                _env_first(("LK_CARTESIA_VOICE", "CARTESIA_TTS_VOICE"), CARTESIA_DEFAULT_FEMALE_VOICE),
             )
         ).strip()
         cartesia_tts_speed = _clamp_float(
             _to_float(
                 agent_config.get("tts_speed"),
-                _env_float_any(("LK_CARTESIA_TTS_SPEED", "CARTESIA_TTS_SPEED"), 1.03),
+                _env_float_any(("LK_CARTESIA_TTS_SPEED", "CARTESIA_TTS_SPEED"), 1.0),
             ),
             0.85,
             1.20,
