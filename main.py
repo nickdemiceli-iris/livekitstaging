@@ -219,6 +219,8 @@ class TranscriptTurn:
 class RuntimeTuning:
     stt_model: str
     stt_language: str
+    turn_detection_mode: str
+    use_turn_handling: bool
     tts_provider: str
     tts_model: str
     tts_voice: str
@@ -234,6 +236,11 @@ class RuntimeTuning:
     min_endpointing_delay: float
     max_endpointing_delay: float
     min_consecutive_speech_delay: float
+    allow_interruptions: bool
+    interruption_mode: str
+    min_interruption_duration: float
+    false_interruption_timeout: float | None
+    resume_false_interruption: bool
     llm_temperature: float
     llm_max_completion_tokens: int
     preemptive_generation: bool
@@ -243,6 +250,10 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     low_latency_mode = _env_bool_any(("LK_LOW_LATENCY_MODE",), True)
 
     stt_language = _env_first(("ASSEMBLYAI__LANGUAGE", "LK_STT_LANGUAGE", "TTS_LANGUAGE"), "en").strip().lower() or "en"
+    raw_turn_detection_mode = _env_first(("AGENT_TURN_DETECTION", "LK_TURN_DETECTION_MODE"), "vad").strip().lower()
+    if raw_turn_detection_mode not in {"multilingual", "vad", "stt", "off", "none"}:
+        raw_turn_detection_mode = "vad"
+    use_turn_handling = _env_bool_any(("LK_USE_TURN_HANDLING",), True)
 
     # Critical reliability fix: AssemblyAI requires 50ms..1000ms.
     raw_buffer = _to_float(
@@ -308,6 +319,29 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         0.0,
         1.5,
     )
+    allow_interruptions = _to_bool(
+        agent_config.get("allow_interruptions"),
+        _env_bool_any(("INTERRUPT_SPEECH_ON_USER_INPUT", "LK_ALLOW_INTERRUPTIONS"), True),
+    )
+    interruption_mode = _env_first(("LK_INTERRUPTION_MODE",), "vad").strip().lower()
+    if interruption_mode not in {"vad", "adaptive"}:
+        interruption_mode = "vad"
+    min_interruption_duration = _clamp_float(
+        _env_float_any(("LK_MIN_INTERRUPTION_DURATION",), 0.2 if low_latency_mode else 0.35),
+        0.05,
+        2.0,
+    )
+    false_interruption_timeout_raw = _env_first(("LK_FALSE_INTERRUPTION_TIMEOUT",), "")
+    false_interruption_timeout: float | None
+    if false_interruption_timeout_raw.strip().lower() == "none":
+        false_interruption_timeout = None
+    else:
+        false_interruption_timeout = _clamp_float(
+            _env_float_any(("LK_FALSE_INTERRUPTION_TIMEOUT",), 1.0 if low_latency_mode else 1.5),
+            0.2,
+            5.0,
+        )
+    resume_false_interruption = _env_bool_any(("LK_RESUME_FALSE_INTERRUPTION",), False)
 
     llm_temp = _clamp_float(
         _to_float(agent_config.get("llm_temperature"), _env_float("LK_LLM_TEMPERATURE", 0.15)),
@@ -428,6 +462,8 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     return RuntimeTuning(
         stt_model=stt_model,
         stt_language=stt_language,
+        turn_detection_mode=raw_turn_detection_mode,
+        use_turn_handling=use_turn_handling,
         tts_provider=tts_provider,
         tts_model=tts_model,
         tts_voice=tts_voice,
@@ -443,6 +479,11 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         min_endpointing_delay=min_ep,
         max_endpointing_delay=max_ep,
         min_consecutive_speech_delay=min_consecutive,
+        allow_interruptions=allow_interruptions,
+        interruption_mode=interruption_mode,
+        min_interruption_duration=min_interruption_duration,
+        false_interruption_timeout=false_interruption_timeout,
+        resume_false_interruption=resume_false_interruption,
         llm_temperature=llm_temp,
         llm_max_completion_tokens=llm_max_tokens,
         preemptive_generation=_to_bool(
@@ -481,6 +522,22 @@ def _extract_item_text(item: Any) -> str:
     return " ".join(parts).strip()
 
 
+def _resolve_turn_detection(
+    tuning: RuntimeTuning,
+    model_turn_detector: Any | None,
+) -> Any | str | None:
+    if tuning.turn_detection_mode in {"off", "none"}:
+        return None
+    if tuning.turn_detection_mode == "stt":
+        return "stt"
+    if tuning.turn_detection_mode == "vad":
+        return "vad"
+    # multilingual mode: use model if available, fallback to VAD for reliability.
+    if model_turn_detector is not None:
+        return model_turn_detector
+    return "vad"
+
+
 async def entrypoint(ctx: JobContext) -> None:
     raw_metadata = getattr(ctx.job, "metadata", None) or "{}"
     metadata = _safe_parse_metadata(raw_metadata)
@@ -516,7 +573,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     tuning = _build_runtime_tuning(agent_config)
     llm_model = str(agent_config.get("llm_model", _env_first(("OPENAI_MODEL", "OPENAI__MODEL"), "gpt-4o-mini")))
-    turn_detector = _build_turn_detector()
+    model_turn_detector = _build_turn_detector()
+    resolved_turn_detection = _resolve_turn_detection(tuning, model_turn_detector)
 
     print(
         (
@@ -529,7 +587,8 @@ async def entrypoint(ctx: JobContext) -> None:
             f"cartesia_tts_speed={tuning.cartesia_tts_speed}, "
             f"tts_fallback_enabled={tuning.tts_fallback_enabled}, "
             f"preemptive_generation={tuning.preemptive_generation}, "
-            f"turn_detector={'on' if turn_detector is not None else 'off'}"
+            f"turn_detection_mode={tuning.turn_detection_mode}, "
+            f"resolved_turn_detection={resolved_turn_detection}"
         ),
         flush=True,
     )
@@ -560,29 +619,65 @@ async def entrypoint(ctx: JobContext) -> None:
             voice=tuning.tts_voice,
         )
 
-    session = AgentSession(
-        stt=assemblyai.STT(
-            model=tuning.stt_model,
-            language_detection=False,
-            end_of_turn_confidence_threshold=tuning.stt_eot_confidence_threshold,
-            min_turn_silence=tuning.stt_min_turn_silence_ms,
-            max_turn_silence=tuning.stt_max_turn_silence_ms,
-            buffer_size_seconds=tuning.stt_buffer_size_seconds,
-        ),
-        llm=openai.LLM(
-            model=llm_model,
-            temperature=tuning.llm_temperature,
-            max_completion_tokens=tuning.llm_max_completion_tokens,
-            parallel_tool_calls=False,
-        ),
-        tts=tts_engine,
-        vad=_get_vad_model(),
-        turn_detection=turn_detector,
-        preemptive_generation=tuning.preemptive_generation,
-        min_endpointing_delay=tuning.min_endpointing_delay,
-        max_endpointing_delay=tuning.max_endpointing_delay,
-        min_consecutive_speech_delay=tuning.min_consecutive_speech_delay,
+    stt_engine = assemblyai.STT(
+        model=tuning.stt_model,
+        language_detection=False,
+        end_of_turn_confidence_threshold=tuning.stt_eot_confidence_threshold,
+        min_turn_silence=tuning.stt_min_turn_silence_ms,
+        max_turn_silence=tuning.stt_max_turn_silence_ms,
+        buffer_size_seconds=tuning.stt_buffer_size_seconds,
     )
+    llm_engine = openai.LLM(
+        model=llm_model,
+        temperature=tuning.llm_temperature,
+        max_completion_tokens=tuning.llm_max_completion_tokens,
+        parallel_tool_calls=False,
+    )
+    vad_engine = _get_vad_model()
+
+    if tuning.use_turn_handling:
+        # New API path (recommended by LiveKit) for lower-latency, production turn-taking.
+        session = AgentSession(
+            stt=stt_engine,
+            llm=llm_engine,
+            tts=tts_engine,
+            vad=vad_engine,
+            turn_handling={
+                "turn_detection": resolved_turn_detection,
+                "endpointing": {
+                    "mode": "dynamic",
+                    "min_delay": tuning.min_endpointing_delay,
+                    "max_delay": tuning.max_endpointing_delay,
+                },
+                "interruption": {
+                    "enabled": tuning.allow_interruptions,
+                    "mode": tuning.interruption_mode,
+                    "min_duration": tuning.min_interruption_duration,
+                    "false_interruption_timeout": tuning.false_interruption_timeout,
+                    "resume_false_interruption": tuning.resume_false_interruption,
+                    "discard_audio_if_uninterruptible": True,
+                },
+            },
+            preemptive_generation=tuning.preemptive_generation,
+            min_consecutive_speech_delay=tuning.min_consecutive_speech_delay,
+        )
+    else:
+        # Legacy path kept behind flag for rollback safety.
+        session = AgentSession(
+            stt=stt_engine,
+            llm=llm_engine,
+            tts=tts_engine,
+            vad=vad_engine,
+            turn_detection=resolved_turn_detection,
+            preemptive_generation=tuning.preemptive_generation,
+            min_endpointing_delay=tuning.min_endpointing_delay,
+            max_endpointing_delay=tuning.max_endpointing_delay,
+            min_consecutive_speech_delay=tuning.min_consecutive_speech_delay,
+            allow_interruptions=tuning.allow_interruptions,
+            min_interruption_duration=tuning.min_interruption_duration,
+            false_interruption_timeout=tuning.false_interruption_timeout,
+            resume_false_interruption=tuning.resume_false_interruption,
+        )
 
     @session.on("conversation_item_added")
     def _on_conversation_item_added(event: Any) -> None:
