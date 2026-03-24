@@ -11,7 +11,7 @@ from typing import Any
 from google.cloud import storage
 
 GCP_PROJECT_ID: str = os.getenv("GCP_PROJECT_ID", "ai-agent-staging-490002")
-TRANSCRIPTS_BUCKET: str = os.getenv("TRANSCRIPTS_BUCKET", "iris-agent-transcripts")
+TRANSCRIPTS_BUCKET: str = os.getenv("TRANSCRIPTS_BUCKET", os.getenv("GCS_BUCKET", "iris-agent-transcripts"))
 
 
 def _now_iso() -> str:

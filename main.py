@@ -51,6 +51,47 @@ def _env_bool(name: str, default: bool) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _env_first(names: tuple[str, ...], default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
+
+def _env_float_any(names: tuple[str, ...], default: float) -> float:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if not value:
+            continue
+        try:
+            return float(value)
+        except ValueError:
+            continue
+    return default
+
+
+def _env_int_any(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if not value:
+            continue
+        try:
+            return int(float(value))
+        except ValueError:
+            continue
+    return default
+
+
+def _env_bool_any(names: tuple[str, ...], default: bool) -> bool:
+    for name in names:
+        value = os.getenv(name, "").strip().lower()
+        if not value:
+            continue
+        return value in {"1", "true", "yes", "on"}
+    return default
+
+
 def _clamp_float(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -95,6 +136,24 @@ def _to_int(value: Any, default: int) -> int:
     return default
 
 
+def _to_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        stripped = value.strip().lower()
+        if not stripped:
+            return default
+        if stripped in {"1", "true", "yes", "on"}:
+            return True
+        if stripped in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 # Lazy init so deploy-time "python main.py download-files" does not fail.
 _VAD_MODEL: Any | None = None
 
@@ -107,7 +166,10 @@ def _get_vad_model() -> Any:
 
 
 def _build_turn_detector() -> Any | None:
-    if not _env_bool("LK_ENABLE_TURN_DETECTOR", True):
+    mode = _env_first(("AGENT_TURN_DETECTION", "LK_TURN_DETECTION_MODE"), "multilingual").strip().lower()
+    if mode in {"off", "none", "vad", "stt"}:
+        return None
+    if not _env_bool_any(("LK_ENABLE_TURN_DETECTOR",), True):
         return None
     if MultilingualModel is None:
         print("Turn detector plugin unavailable; continuing without turn detector.", flush=True)
@@ -172,7 +234,7 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     # Critical reliability fix: AssemblyAI requires 50ms..1000ms.
     raw_buffer = _to_float(
         agent_config.get("stt_buffer_size_seconds"),
-        _env_float("LK_STT_BUFFER_SIZE_SECONDS", 0.06),
+        _env_float_any(("LK_STT_BUFFER_SIZE_SECONDS", "ASSEMBLYAI_BUFFER_SIZE_SECONDS"), 0.06),
     )
     stt_buffer = _clamp_float(raw_buffer, 0.05, 1.0)
     if stt_buffer != raw_buffer:
@@ -183,11 +245,11 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
 
     raw_min_turn = _to_int(
         agent_config.get("stt_min_turn_silence_ms"),
-        _env_int("LK_STT_MIN_TURN_SILENCE_MS", 300),
+        _env_int_any(("LK_STT_MIN_TURN_SILENCE_MS", "ASSEMBLYAI_MIN_EOT_SILENCE_MS"), 300),
     )
     raw_max_turn = _to_int(
         agent_config.get("stt_max_turn_silence_ms"),
-        _env_int("LK_STT_MAX_TURN_SILENCE_MS", 900),
+        _env_int_any(("LK_STT_MAX_TURN_SILENCE_MS", "ASSEMBLYAI_MAX_TURN_SILENCE_MS"), 900),
     )
     min_turn = _clamp_int(raw_min_turn, 150, 2000)
     max_turn = _clamp_int(raw_max_turn, 300, 5000)
@@ -197,7 +259,10 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     eot_conf = _clamp_float(
         _to_float(
             agent_config.get("stt_end_of_turn_confidence_threshold"),
-            _env_float("LK_STT_END_OF_TURN_CONFIDENCE_THRESHOLD", 0.55),
+            _env_float_any(
+                ("LK_STT_END_OF_TURN_CONFIDENCE_THRESHOLD", "ASSEMBLYAI_END_OF_TURN_CONFIDENCE_THRESHOLD"),
+                0.55,
+            ),
         ),
         0.0,
         1.0,
@@ -246,7 +311,13 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     )
 
     raw_stt_model = str(
-        agent_config.get("stt_model", os.getenv("LK_STT_MODEL", "universal-streaming-english"))
+        agent_config.get(
+            "stt_model",
+            _env_first(
+                ("LK_STT_MODEL", "ASSEMBLYAI_MODEL", "ASSEMBLYAI__MODEL"),
+                "universal-streaming-english",
+            ),
+        )
     ).strip()
     allowed_stt_models = {
         "universal-streaming-english",
@@ -258,13 +329,22 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     if stt_model != raw_stt_model:
         print(f"Unsupported stt_model '{raw_stt_model}', using '{stt_model}'", flush=True)
 
-    raw_tts_provider = str(agent_config.get("tts_provider", os.getenv("LK_TTS_PROVIDER", "openai"))).strip().lower()
+    env_tts_provider = _env_first(("LK_TTS_PROVIDER",), "").strip().lower()
+    if not env_tts_provider:
+        env_tts_provider = "cartesia" if _env_bool_any(("CARTESIA_TTS_ENABLED",), False) else "openai"
+
+    raw_tts_provider = str(agent_config.get("tts_provider", env_tts_provider or "openai")).strip().lower()
     tts_provider = raw_tts_provider if raw_tts_provider in {"openai", "cartesia"} else "openai"
     if tts_provider != raw_tts_provider:
         print(f"Unsupported tts_provider '{raw_tts_provider}', using '{tts_provider}'", flush=True)
 
     if tts_provider == "cartesia":
-        raw_tts_model = str(agent_config.get("tts_model", os.getenv("LK_TTS_MODEL", "sonic-turbo"))).strip()
+        raw_tts_model = str(
+            agent_config.get(
+                "tts_model",
+                _env_first(("LK_TTS_MODEL", "CARTESIA_TTS_MODEL"), "sonic-turbo"),
+            )
+        ).strip()
         allowed_tts_models = {"sonic-turbo", "sonic-3", "sonic-2", "sonic"}
         tts_model = raw_tts_model if raw_tts_model in allowed_tts_models else "sonic-turbo"
         if tts_model != raw_tts_model:
@@ -272,16 +352,29 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         tts_voice = str(
             agent_config.get(
                 "voice",
-                os.getenv("LK_CARTESIA_VOICE", "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
+                _env_first(("LK_CARTESIA_VOICE", "CARTESIA_TTS_VOICE"), "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
             )
         ).strip()
     else:
-        raw_tts_model = str(agent_config.get("openai_tts_model", os.getenv("LK_OPENAI_TTS_MODEL", "gpt-4o-mini-tts"))).strip()
+        raw_tts_model = str(
+            agent_config.get(
+                "openai_tts_model",
+                _env_first(("LK_OPENAI_TTS_MODEL", "OPENAI_TTS_MODEL"), "gpt-4o-mini-tts"),
+            )
+        ).strip()
         allowed_tts_models = {"gpt-4o-mini-tts", "gpt-4o-realtime-preview-tts"}
         tts_model = raw_tts_model if raw_tts_model in allowed_tts_models else "gpt-4o-mini-tts"
         if tts_model != raw_tts_model:
             print(f"Unsupported openai tts_model '{raw_tts_model}', using '{tts_model}'", flush=True)
-        tts_voice = str(agent_config.get("openai_tts_voice", os.getenv("LK_OPENAI_TTS_VOICE", "ash"))).strip() or "ash"
+        tts_voice = (
+            str(
+                agent_config.get(
+                    "openai_tts_voice",
+                    _env_first(("LK_OPENAI_TTS_VOICE", "OPENAI_TTS_VOICE"), "ash"),
+                )
+            ).strip()
+            or "ash"
+        )
 
     return RuntimeTuning(
         stt_model=stt_model,
@@ -297,7 +390,10 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         min_consecutive_speech_delay=min_consecutive,
         llm_temperature=llm_temp,
         llm_max_completion_tokens=llm_max_tokens,
-        preemptive_generation=_env_bool("LK_PREEMPTIVE_GENERATION", True),
+        preemptive_generation=_to_bool(
+            agent_config.get("preemptive_generation"),
+            _env_bool_any(("LK_PREEMPTIVE_GENERATION", "AGENT_PREEMPTIVE_SYNTHESIS"), True),
+        ),
     )
 
 
@@ -364,8 +460,20 @@ async def entrypoint(ctx: JobContext) -> None:
             print(f"Could not update event status: {exc}", flush=True)
 
     tuning = _build_runtime_tuning(agent_config)
-    llm_model = str(agent_config.get("llm_model", "gpt-4o-mini"))
+    llm_model = str(agent_config.get("llm_model", _env_first(("OPENAI_MODEL", "OPENAI__MODEL"), "gpt-4o-mini")))
     turn_detector = _build_turn_detector()
+
+    print(
+        (
+            "Runtime settings: "
+            f"stt_model={tuning.stt_model}, "
+            f"tts_provider={tuning.tts_provider}, "
+            f"tts_model={tuning.tts_model}, "
+            f"preemptive_generation={tuning.preemptive_generation}, "
+            f"turn_detector={'on' if turn_detector is not None else 'off'}"
+        ),
+        flush=True,
+    )
 
     if tuning.tts_provider == "cartesia":
         tts_engine = cartesia.TTS(
