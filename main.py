@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -10,7 +11,11 @@ from typing import Any
 from dotenv import load_dotenv
 from livekit.agents import AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import assemblyai, cartesia, openai, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+try:
+    from livekit.plugins.turn_detector.multilingual import MultilingualModel
+except Exception:  # pragma: no cover - fallback for environments missing the plugin
+    MultilingualModel = None
 
 from agents.sales import build_sales_agent, derive_outcome
 from firestore_client import get_agent_config, update_event_status, write_event_disposition
@@ -54,6 +59,42 @@ def _clamp_int(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+def _to_float(value: Any, default: float) -> float:
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return float(stripped)
+        except ValueError:
+            return default
+    return default
+
+
+def _to_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return int(float(stripped))
+        except ValueError:
+            return default
+    return default
+
+
 # Lazy init so deploy-time "python main.py download-files" does not fail.
 _VAD_MODEL: Any | None = None
 
@@ -67,6 +108,9 @@ def _get_vad_model() -> Any:
 
 def _build_turn_detector() -> Any | None:
     if not _env_bool("LK_ENABLE_TURN_DETECTOR", True):
+        return None
+    if MultilingualModel is None:
+        print("Turn detector plugin unavailable; continuing without turn detector.", flush=True)
         return None
     threshold = _clamp_float(_env_float("LK_TURN_UNLIKELY_THRESHOLD", 0.25), 0.0, 1.0)
     try:
@@ -84,6 +128,13 @@ def _safe_parse_metadata(raw_metadata: Any) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(str(raw_metadata))
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    try:
+        decoded = base64.b64decode(str(raw_metadata)).decode()
+        parsed = json.loads(decoded)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
@@ -117,8 +168,9 @@ class RuntimeTuning:
 
 def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
     # Critical reliability fix: AssemblyAI requires 50ms..1000ms.
-    raw_buffer = float(
-        agent_config.get("stt_buffer_size_seconds", _env_float("LK_STT_BUFFER_SIZE_SECONDS", 0.06))
+    raw_buffer = _to_float(
+        agent_config.get("stt_buffer_size_seconds"),
+        _env_float("LK_STT_BUFFER_SIZE_SECONDS", 0.06),
     )
     stt_buffer = _clamp_float(raw_buffer, 0.05, 1.0)
     if stt_buffer != raw_buffer:
@@ -127,31 +179,41 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
             flush=True,
         )
 
-    raw_min_turn = int(agent_config.get("stt_min_turn_silence_ms", _env_int("LK_STT_MIN_TURN_SILENCE_MS", 300)))
-    raw_max_turn = int(agent_config.get("stt_max_turn_silence_ms", _env_int("LK_STT_MAX_TURN_SILENCE_MS", 900)))
+    raw_min_turn = _to_int(
+        agent_config.get("stt_min_turn_silence_ms"),
+        _env_int("LK_STT_MIN_TURN_SILENCE_MS", 300),
+    )
+    raw_max_turn = _to_int(
+        agent_config.get("stt_max_turn_silence_ms"),
+        _env_int("LK_STT_MAX_TURN_SILENCE_MS", 900),
+    )
     min_turn = _clamp_int(raw_min_turn, 150, 2000)
     max_turn = _clamp_int(raw_max_turn, 300, 5000)
     if max_turn < min_turn:
         max_turn = min_turn
 
     eot_conf = _clamp_float(
-        float(
-            agent_config.get(
-                "stt_end_of_turn_confidence_threshold",
-                _env_float("LK_STT_END_OF_TURN_CONFIDENCE_THRESHOLD", 0.55),
-            )
+        _to_float(
+            agent_config.get("stt_end_of_turn_confidence_threshold"),
+            _env_float("LK_STT_END_OF_TURN_CONFIDENCE_THRESHOLD", 0.55),
         ),
         0.0,
         1.0,
     )
 
     min_ep = _clamp_float(
-        float(agent_config.get("min_endpointing_delay", _env_float("LK_MIN_ENDPOINTING_DELAY", 0.15))),
+        _to_float(
+            agent_config.get("min_endpointing_delay"),
+            _env_float("LK_MIN_ENDPOINTING_DELAY", 0.15),
+        ),
         0.0,
         5.0,
     )
     max_ep = _clamp_float(
-        float(agent_config.get("max_endpointing_delay", _env_float("LK_MAX_ENDPOINTING_DELAY", 0.90))),
+        _to_float(
+            agent_config.get("max_endpointing_delay"),
+            _env_float("LK_MAX_ENDPOINTING_DELAY", 0.90),
+        ),
         0.1,
         8.0,
     )
@@ -159,21 +221,50 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
         max_ep = min_ep
 
     min_consecutive = _clamp_float(
-        float(agent_config.get("min_consecutive_speech_delay", _env_float("LK_MIN_CONSECUTIVE_SPEECH_DELAY", 0.05))),
+        _to_float(
+            agent_config.get("min_consecutive_speech_delay"),
+            _env_float("LK_MIN_CONSECUTIVE_SPEECH_DELAY", 0.05),
+        ),
         0.0,
         1.5,
     )
 
-    llm_temp = _clamp_float(float(agent_config.get("llm_temperature", _env_float("LK_LLM_TEMPERATURE", 0.2))), 0.0, 1.2)
+    llm_temp = _clamp_float(
+        _to_float(agent_config.get("llm_temperature"), _env_float("LK_LLM_TEMPERATURE", 0.2)),
+        0.0,
+        1.2,
+    )
     llm_max_tokens = _clamp_int(
-        int(agent_config.get("llm_max_completion_tokens", _env_int("LK_LLM_MAX_COMPLETION_TOKENS", 90))),
+        _to_int(
+            agent_config.get("llm_max_completion_tokens"),
+            _env_int("LK_LLM_MAX_COMPLETION_TOKENS", 90),
+        ),
         32,
         600,
     )
 
+    raw_stt_model = str(
+        agent_config.get("stt_model", os.getenv("LK_STT_MODEL", "universal-streaming-english"))
+    ).strip()
+    allowed_stt_models = {
+        "universal-streaming-english",
+        "universal-streaming-multilingual",
+        "u3-rt-pro",
+        "u3-pro",
+    }
+    stt_model = raw_stt_model if raw_stt_model in allowed_stt_models else "universal-streaming-english"
+    if stt_model != raw_stt_model:
+        print(f"Unsupported stt_model '{raw_stt_model}', using '{stt_model}'", flush=True)
+
+    raw_tts_model = str(agent_config.get("tts_model", os.getenv("LK_TTS_MODEL", "sonic-turbo"))).strip()
+    allowed_tts_models = {"sonic-turbo", "sonic-3", "sonic-2", "sonic"}
+    tts_model = raw_tts_model if raw_tts_model in allowed_tts_models else "sonic-turbo"
+    if tts_model != raw_tts_model:
+        print(f"Unsupported tts_model '{raw_tts_model}', using '{tts_model}'", flush=True)
+
     return RuntimeTuning(
-        stt_model=str(agent_config.get("stt_model", os.getenv("LK_STT_MODEL", "universal-streaming-english"))),
-        tts_model=str(agent_config.get("tts_model", os.getenv("LK_TTS_MODEL", "sonic-turbo"))),
+        stt_model=stt_model,
+        tts_model=tts_model,
         stt_buffer_size_seconds=stt_buffer,
         stt_min_turn_silence_ms=min_turn,
         stt_max_turn_silence_ms=max_turn,
@@ -231,6 +322,9 @@ async def entrypoint(ctx: JobContext) -> None:
         agent_config = get_agent_config(client_id, agent_id)
     except Exception as exc:
         print(f"Failed to load agent config: {exc}", flush=True)
+        agent_config = {}
+    if not isinstance(agent_config, dict):
+        print("Agent config had unexpected type; using empty defaults.", flush=True)
         agent_config = {}
 
     agent, disposition = build_sales_agent(contact, agent_config)
