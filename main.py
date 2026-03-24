@@ -218,6 +218,7 @@ class RuntimeTuning:
     tts_provider: str
     tts_model: str
     tts_voice: str
+    cartesia_tts_speed: float
     openai_tts_model: str
     openai_tts_voice: str
     tts_fallback_enabled: bool
@@ -377,6 +378,14 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
                 _env_first(("LK_CARTESIA_VOICE", "CARTESIA_TTS_VOICE"), "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"),
             )
         ).strip()
+        cartesia_tts_speed = _clamp_float(
+            _to_float(
+                agent_config.get("tts_speed"),
+                _env_float_any(("LK_CARTESIA_TTS_SPEED", "CARTESIA_TTS_SPEED"), 1.03),
+            ),
+            0.85,
+            1.20,
+        )
     else:
         raw_tts_model = str(
             agent_config.get(
@@ -392,17 +401,19 @@ def _build_runtime_tuning(agent_config: dict[str, Any]) -> RuntimeTuning:
             str(
                 agent_config.get(
                     "openai_tts_voice",
-                    _env_first(("LK_OPENAI_TTS_VOICE", "OPENAI_TTS_VOICE"), "ash"),
+                    _env_first(("LK_OPENAI_TTS_VOICE", "OPENAI_TTS_VOICE"), "alloy"),
                 )
             ).strip()
-            or "ash"
+            or "alloy"
         )
+        cartesia_tts_speed = 1.0
 
     return RuntimeTuning(
         stt_model=stt_model,
         tts_provider=tts_provider,
         tts_model=tts_model,
         tts_voice=tts_voice,
+        cartesia_tts_speed=cartesia_tts_speed,
         openai_tts_model=openai_tts_model,
         openai_tts_voice=openai_tts_voice,
         tts_fallback_enabled=tts_fallback_enabled,
@@ -495,6 +506,8 @@ async def entrypoint(ctx: JobContext) -> None:
             f"stt_model={tuning.stt_model}, "
             f"tts_provider={tuning.tts_provider}, "
             f"tts_model={tuning.tts_model}, "
+            f"tts_voice={tuning.tts_voice}, "
+            f"cartesia_tts_speed={tuning.cartesia_tts_speed}, "
             f"tts_fallback_enabled={tuning.tts_fallback_enabled}, "
             f"preemptive_generation={tuning.preemptive_generation}, "
             f"turn_detector={'on' if turn_detector is not None else 'off'}"
@@ -506,6 +519,7 @@ async def entrypoint(ctx: JobContext) -> None:
         cartesia_tts_engine = cartesia.TTS(
             model=tuning.tts_model,
             voice=tuning.tts_voice,
+            speed=tuning.cartesia_tts_speed,
             language="en",
             word_timestamps=False,
         )
