@@ -17,7 +17,7 @@ try:
 except Exception:  # pragma: no cover - fallback for environments missing the plugin
     MultilingualModel = None
 
-from agents.sales import build_sales_agent, derive_outcome
+from agents.router import build_agent_runtime
 from firestore_client import get_agent_config, update_event_status, write_event_disposition
 from gcs_client import write_transcript
 
@@ -558,7 +558,13 @@ async def entrypoint(ctx: JobContext) -> None:
         print("Agent config had unexpected type; using empty defaults.", flush=True)
         agent_config = {}
 
-    agent, disposition = build_sales_agent(contact, agent_config)
+    runtime = build_agent_runtime(
+        agent_id=agent_id,
+        contact=contact,
+        agent_config=agent_config,
+    )
+    agent = runtime.agent
+    disposition = runtime.disposition
 
     await ctx.connect()
     call_started_at = datetime.now(timezone.utc)
@@ -579,6 +585,7 @@ async def entrypoint(ctx: JobContext) -> None:
     print(
         (
             "Runtime settings: "
+            f"agent_runtime={runtime.runtime_kind}, "
             f"stt_model={tuning.stt_model}, "
             f"stt_language={tuning.stt_language}, "
             f"tts_provider={tuning.tts_provider}, "
@@ -710,7 +717,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
         call_ended_at = datetime.now(timezone.utc)
         duration_seconds = max(0, int((call_ended_at - call_started_at).total_seconds()))
-        outcome = derive_outcome(disposition)
+        outcome = runtime.derive_outcome(disposition)
         disposition_dict = asdict(disposition)
 
         print(f"Call ended. trigger={trigger} outcome={outcome}", flush=True)
@@ -725,6 +732,7 @@ async def entrypoint(ctx: JobContext) -> None:
                     metadata={
                         "outcome": outcome,
                         "agent_id": agent_id,
+                        "agent_runtime": runtime.runtime_kind,
                         "duration_seconds": duration_seconds,
                     },
                 )
@@ -773,9 +781,10 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 if __name__ == "__main__":
+    worker_agent_name = _env_first(("WORKER_AGENT_NAME", "LIVEKIT_AGENT_NAME"), "verifacto-outbound-agent")
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
-            agent_name="verifacto-sales-agent",
+            agent_name=worker_agent_name,
         )
     )
