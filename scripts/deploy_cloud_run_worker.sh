@@ -26,6 +26,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --image "${IMAGE_URI}" \
   --platform managed \
   --execution-environment gen2 \
+  --port 8081 \
   --concurrency 1 \
   --min-instances 1 \
   --max-instances 20 \
