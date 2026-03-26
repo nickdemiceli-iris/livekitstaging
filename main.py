@@ -762,14 +762,48 @@ async def entrypoint(ctx: JobContext) -> None:
     agent_name = str(agent_config.get("agent_name", "Sophie"))
     company_name = str(agent_config.get("company_name", "our company"))
 
+    participant_identity = str(
+        metadata.get("sip_participant_identity")
+        or metadata.get("participant_identity")
+        or metadata.get("callee_identity")
+        or ""
+    ).strip()
+    wait_timeout_s = _clamp_float(
+        _env_float_any(("LK_WAIT_FOR_PARTICIPANT_TIMEOUT_SECONDS",), 20.0),
+        1.0,
+        120.0,
+    )
+    try:
+        if participant_identity:
+            print(f"Waiting for participant identity={participant_identity}", flush=True)
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(identity=participant_identity),
+                timeout=wait_timeout_s,
+            )
+        else:
+            print("Waiting for first remote participant", flush=True)
+            participant = await asyncio.wait_for(
+                ctx.wait_for_participant(),
+                timeout=wait_timeout_s,
+            )
+        print(
+            f"Participant connected: identity={getattr(participant, 'identity', 'unknown')}",
+            flush=True,
+        )
+    except Exception as exc:
+        # Continue even if wait times out; session can still recover on some providers.
+        print(f"wait_for_participant skipped: {exc}", flush=True)
+
     await session.start(room=ctx.room, agent=agent)
 
-    # Deterministic opening line gives reliable first speech.
-    await session.say(
-        f"Hello, this is {agent_name}. I'm a virtual representative calling from {company_name}. "
-        f"May I please speak with {customer_name}?",
-        add_to_chat_ctx=True,
-    )
+    opening_line = str(agent_config.get("opening_line", "")).strip()
+    if not opening_line:
+        opening_line = (
+            f"Hello, this is {agent_name}. I'm a virtual representative calling from {company_name}. "
+            f"May I please speak with {customer_name}?"
+        )
+    print(f"SAYING: {opening_line}", flush=True)
+    await session.say(opening_line, add_to_chat_ctx=True)
 
     try:
         while True:
