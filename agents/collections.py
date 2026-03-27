@@ -63,13 +63,14 @@ def derive_outcome(disposition: CollectionsDispositionState) -> str:
 def build_collections_agent(
     contact: dict[str, Any],
     agent_config: dict[str, Any],
+    opening_line: str = "",
 ) -> tuple["CollectionsAgent", CollectionsDispositionState]:
     agent_name = str(agent_config.get("agent_name", "Ava"))
     company_name = str(agent_config.get("company_name", "Simple Loans"))
     customer_name = str(contact.get("customer_name", "there"))
     due_amount_usd = str(contact.get("due_amount_usd", ""))
     due_date = str(contact.get("due_date", ""))
-    opening_line = str(agent_config.get("opening_line", "")).strip()
+    opening_line = opening_line.strip() or str(agent_config.get("opening_line", "")).strip()
     customer_context = _build_customer_context(contact)
 
     system_prompt = str(agent_config.get("system_prompt", "")).strip()

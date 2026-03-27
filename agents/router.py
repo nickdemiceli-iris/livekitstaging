@@ -18,6 +18,31 @@ class AgentRuntime:
     derive_outcome: Callable[[Any], str]
 
 
+def build_agent(
+    *,
+    agent_id: str,
+    contact: dict[str, Any],
+    agent_config: dict[str, Any],
+    opening_line: str = "",
+) -> tuple[Agent, Any]:
+    """
+    Backward-compatible router helper for older entrypoints.
+
+    Some deployed workers still import/call `build_agent(...)` and may pass
+    `opening_line`. Keep this wrapper so mixed-version deploys do not crash.
+    """
+
+    requested_kind = str(agent_config.get("agent_kind", agent_id)).strip().lower()
+    if not requested_kind:
+        requested_kind = "sales"
+
+    if requested_kind in {"collections", "collection", "debt_collection"}:
+        return build_collections_agent(contact, agent_config, opening_line=opening_line)
+    if requested_kind in {"retention", "save", "customer_retention"}:
+        return build_retention_agent(contact, agent_config)
+    return build_sales_agent(contact, agent_config)
+
+
 def build_agent_runtime(
     *,
     agent_id: str,
