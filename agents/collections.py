@@ -69,6 +69,7 @@ def build_collections_agent(
     customer_name = str(contact.get("customer_name", "there"))
     due_amount_usd = str(contact.get("due_amount_usd", ""))
     due_date = str(contact.get("due_date", ""))
+    opening_line = str(agent_config.get("opening_line", "")).strip()
     customer_context = _build_customer_context(contact)
 
     system_prompt = str(agent_config.get("system_prompt", "")).strip()
@@ -80,6 +81,7 @@ def build_collections_agent(
                 customer_name=customer_name,
                 due_amount_usd=due_amount_usd,
                 due_date=due_date,
+                opening_line=opening_line,
                 customer_context=customer_context,
             )
         except KeyError as exc:
@@ -93,6 +95,7 @@ def build_collections_agent(
             company_name=company_name,
             due_amount_usd=due_amount_usd,
             due_date=due_date,
+            opening_line=opening_line,
         )
 
     disposition = CollectionsDispositionState()
